@@ -397,5 +397,288 @@ class TestConnectionLossAndRestart(ApiTestBase):
         self.close(s2["session_id"])
 
 
+class TestCedingReport(ApiTestBase):
+    """再保报送清单 API 的端到端覆盖。"""
+
+    def _payload(self, policy_id=1, parties=None, booked=None):
+        if parties is None:
+            # 默认两家 50/50，核定总额先占位，由用例自行覆盖
+            parties = [
+                {"party": "A", "ratio_bps": 5000, "approved_total": 0},
+                {"party": "B", "ratio_bps": 5000, "approved_total": 0},
+            ]
+        body = {"policy_id": policy_id, "parties": parties}
+        if booked is not None:
+            body["booked"] = booked
+        return body
+
+    def _report(self, sid, body):
+        return self.client.post(f"/sessions/{sid}/ceding-report", json=body)
+
+    def test_happy_path_row_and_column_constraints(self):
+        reset_seed_data()
+        s = self.open("华北")
+        sid = s["session_id"]
+        # 保单 1 在种子数据中有 80 笔理赔；先取其金额总和
+        rows = []
+        page = 1
+        while True:
+            b = self.page(sid, page=page, page_size=100).json()
+            for r in b["rows"]:
+                if r["policy_id"] == 1:
+                    rows.append(r)
+            if not b["has_more"]:
+                break
+            page += 1
+        total = sum(r["amount"] for r in rows)
+        half = total // 2
+        # 总额为奇数时让 B 多 1 分
+        parties = [
+            {"party": "A", "ratio_bps": 5000, "approved_total": half},
+            {"party": "B", "ratio_bps": 5000, "approved_total": total - half},
+        ]
+        r = self._report(sid, self._payload(policy_id=1, parties=parties))
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["claim_count"], 80)
+        self.assertEqual(len(body["claims"]), 80)
+        ids = [c["claim_id"] for c in body["claims"]]
+        self.assertEqual(ids, sorted(ids))
+        # 行和 + 每格 floor/ceil + 列和
+        col = {"A": 0, "B": 0}
+        for c in body["claims"]:
+            self.assertEqual(sum(sh["amount"] for sh in c["shares"]), c["amount"])
+            self.assertEqual([sh["party"] for sh in c["shares"]], ["A", "B"])
+            for sh in c["shares"]:
+                col[sh["party"]] += sh["amount"]
+                floor = c["amount"] * sh["ratio_bps"] // 10000
+                ceil = floor + (0 if c["amount"] * sh["ratio_bps"] % 10000 == 0 else 1)
+                self.assertGreaterEqual(sh["amount"], floor)
+                self.assertLessEqual(sh["amount"], ceil)
+        self.assertEqual(col, {"A": half, "B": total - half})
+        self.assertEqual(
+            body["parties"],
+            [
+                {"party": "A", "ratio_bps": 5000,
+                 "approved_total": half, "allocated_total": half},
+                {"party": "B", "ratio_bps": 5000,
+                 "approved_total": total - half, "allocated_total": total - half},
+            ],
+        )
+        self.close(sid)
+
+    def test_repeat_report_identical(self):
+        reset_seed_data()
+        s = self.open("华南")
+        sid = s["session_id"]
+        rows = self.page(sid, page_size=100).json()["rows"]
+        total = sum(r["amount"] for r in rows if r["policy_id"] == 5)
+        parties = [
+            {"party": "甲", "ratio_bps": 3000, "approved_total": total * 3 // 10},
+            {"party": "乙", "ratio_bps": 7000,
+             "approved_total": total - total * 3 // 10},
+        ]
+        body = self._payload(policy_id=5, parties=parties)
+        r1 = self._report(sid, body).json()
+        r2 = self._report(sid, body).json()
+        self.assertEqual(r1, r2)
+        self.assertEqual(r1["snapshot_time"], r2["snapshot_time"])
+        self.close(sid)
+
+    def test_booked_items_preserved(self):
+        reset_seed_data()
+        s = self.open("华北")
+        sid = s["session_id"]
+        rows = sorted(
+            (r for r in self.page(sid, page_size=100).json()["rows"]
+             if r["policy_id"] == 1),
+            key=lambda r: r["claim_id"],
+        )
+        # 33.33% 比例下取一笔非整除理赔（种子金额均为 100 的倍数，
+        # 100*3333/10000=33.33 非整除），构造一笔合法入账（ceil 给 A）
+        ratio_a = 3333
+        target = next(
+            r for r in rows if r["amount"] * ratio_a % 10000 != 0
+        )
+        ceil_val = (target["amount"] * ratio_a + 9999) // 10000
+        total = sum(r["amount"] for r in rows)
+        # A 拿该笔 ceil：A 核定 = 全部 floor 之和 + 该笔多出的 1 分
+        floor_sum_a = sum(r["amount"] * ratio_a // 10000 for r in rows)
+        approved_a = floor_sum_a + 1
+        approved_b = total - approved_a
+        parties = [
+            {"party": "A", "ratio_bps": ratio_a, "approved_total": approved_a},
+            {"party": "B", "ratio_bps": 10000 - ratio_a, "approved_total": approved_b},
+        ]
+        booked = [{"claim_id": target["claim_id"], "party": "A", "amount": ceil_val}]
+        r = self._report(sid, self._payload(1, parties, booked))
+        self.assertEqual(r.status_code, 200, r.text)
+        claim = next(c for c in r.json()["claims"]
+                     if c["claim_id"] == target["claim_id"])
+        share_a = next(sh for sh in claim["shares"] if sh["party"] == "A")
+        self.assertEqual(share_a["amount"], ceil_val)
+        self.assertTrue(share_a["booked"])
+        # 列和仍然精确对齐
+        for p in r.json()["parties"]:
+            self.assertEqual(p["allocated_total"], p["approved_total"])
+        self.close(sid)
+
+    def test_infeasible_returns_422_with_no_partial_list(self):
+        reset_seed_data()
+        s = self.open("华北")
+        sid = s["session_id"]
+        rows = self.page(sid, page_size=100).json()["rows"]
+        total = sum(r["amount"] for r in rows if r["policy_id"] == 1)
+        parties = [
+            {"party": "A", "ratio_bps": 5000, "approved_total": total},
+            # 故意让总额对不上
+            {"party": "B", "ratio_bps": 5000, "approved_total": total + 1},
+        ]
+        r = self._report(sid, self._payload(1, parties))
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["code"], "totals_mismatch")
+        self.assertNotIn("claims", r.json())
+        self.close(sid)
+
+    def test_invalid_ratios_422(self):
+        reset_seed_data()
+        s = self.open("华北")
+        sid = s["session_id"]
+        parties = [
+            {"party": "A", "ratio_bps": 4000, "approved_total": 1},
+            {"party": "B", "ratio_bps": 5000, "approved_total": 1},
+        ]
+        # Pydantic model_validator 失败 -> 422
+        r = self._report(sid, self._payload(1, parties))
+        self.assertEqual(r.status_code, 422)
+        self.close(sid)
+
+    def test_wrong_party_count_422(self):
+        reset_seed_data()
+        s = self.open("华北")
+        sid = s["session_id"]
+        body = {
+            "policy_id": 1,
+            "parties": [
+                {"party": "A", "ratio_bps": 10000, "approved_total": 1}
+            ],
+        }
+        self.assertEqual(self._report(sid, body).status_code, 422)
+        body6 = {
+            "policy_id": 1,
+            "parties": [
+                {"party": f"P{i}", "ratio_bps": 2000, "approved_total": 0}
+                for i in range(5)
+            ],
+        }
+        # 5 家合法比例 -> 不报数量错（这里 5*2000=10000 通过结构校验，
+        # 仅总额不匹配）；再构造 6 家确认上限
+        body6["parties"].append(
+            {"party": "P5", "ratio_bps": 1, "approved_total": 0}
+        )
+        self.assertEqual(self._report(sid, body6).status_code, 422)
+        self.close(sid)
+
+    def test_booked_unknown_claim_422(self):
+        reset_seed_data()
+        s = self.open("华北")
+        sid = s["session_id"]
+        rows = self.page(sid, page_size=100).json()["rows"]
+        total = sum(r["amount"] for r in rows if r["policy_id"] == 1)
+        parties = [
+            {"party": "A", "ratio_bps": 5000, "approved_total": total // 2},
+            {"party": "B", "ratio_bps": 5000,
+             "approved_total": total - total // 2},
+        ]
+        booked = [{"claim_id": 999999, "party": "A", "amount": 1}]
+        r = self._report(sid, self._payload(1, parties, booked))
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["code"], "booked_claim_unknown")
+        self.close(sid)
+
+    def test_policy_not_in_region_404(self):
+        reset_seed_data()
+        # 保单 3 属于华东；在华南会话中请求
+        s = self.open("华南")
+        sid = s["session_id"]
+        r = self._report(sid, self._payload(policy_id=3))
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["code"], "policy_not_found")
+        # 不存在的保单同样 404
+        r2 = self._report(sid, self._payload(policy_id=999999))
+        self.assertEqual(r2.status_code, 404)
+        self.close(sid)
+
+    def test_closed_session_rejects_report(self):
+        reset_seed_data()
+        s = self.open("华北")
+        sid = s["session_id"]
+        self.close(sid)
+        r = self._report(sid, self._payload(1))
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["code"], "session_not_open")
+        self.assertNotIn("claims", r.json())
+
+    def test_expired_session_rejects_report(self):
+        reset_seed_data()
+        s = self.open("华南")
+        sid = s["session_id"]
+        time.sleep(TTL + 0.6)
+        r = self._report(sid, self._payload(5))
+        self.assertIn(r.status_code, (409, 410))
+        self.assertNotIn("claims", r.json())
+
+    def test_unknown_session_404(self):
+        r = self.client.post(
+            "/sessions/nonexistent/ceding-report", json=self._payload(1)
+        )
+        self.assertEqual(r.status_code, 404)
+
+    def test_snapshot_isolation_for_report(self):
+        reset_seed_data()
+        s = self.open("华北")
+        sid = s["session_id"]
+        before_rows = [
+            r for r in self.page(sid, page_size=100).json()["rows"]
+            if r["policy_id"] == 1
+        ]
+        before_total = sum(r["amount"] for r in before_rows)
+        # 源端给保单 1 新增一笔理赔并提交
+        nc = self.client.post(
+            "/admin/claims", json={"policy_id": 1, "amount": 12345}
+        )
+        self.assertEqual(nc.status_code, 201)
+        half = before_total // 2
+        parties = [
+            {"party": "A", "ratio_bps": 5000, "approved_total": half},
+            {"party": "B", "ratio_bps": 5000,
+             "approved_total": before_total - half},
+        ]
+        r = self._report(sid, self._payload(1, parties))
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["claim_count"], len(before_rows))
+        self.assertNotIn(nc.json()["id"],
+                         [c["claim_id"] for c in r.json()["claims"]])
+        self.close(sid)
+
+    def test_empty_policy_returns_empty_list(self):
+        reset_seed_data()
+        # 新建一个华北保单，没有任何理赔
+        pol = self.client.post("/admin/policies", json={"region": "华北"})
+        self.assertEqual(pol.status_code, 201)
+        pid = pol.json()["id"]
+        s = self.open("华北")
+        sid = s["session_id"]
+        parties = [
+            {"party": "A", "ratio_bps": 5000, "approved_total": 0},
+            {"party": "B", "ratio_bps": 5000, "approved_total": 0},
+        ]
+        r = self._report(sid, self._payload(pid, parties))
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["claims"], [])
+        self.assertEqual(r.json()["claim_count"], 0)
+        self.close(sid)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -180,8 +180,117 @@ def main() -> int:
     call("POST", f"/sessions/{s5['session_id']}/close")
 
     # ------------------------------------------------------------------
+    title(5, "再保报送清单：份额取整到整分、对齐核定总额、入账原样保留")
+    # 用华南会话、保单 5（40 笔理赔）演示
+    _, sr = call("POST", "/sessions", {"region": "华南"})
+    sidr = sr["session_id"]
+    _, rp = call("GET", f"/sessions/{sidr}/claims?page=1&page_size=100")
+    rrows = rp["rows"]
+    rtotal = sum(r["amount"] for r in rrows)
+    ratios = [5000, 3000, 2000]
+    # 以逐笔 floor 为基数，余数全部先归第一家构造一组可行核定总额
+    floors = [sum(r["amount"] * w // 10000 for r in rrows) for w in ratios]
+    approved = floors.copy()
+    approved[0] += rtotal - sum(floors)
+    parties = [
+        {"party": f"P{j}", "ratio_bps": ratios[j], "approved_total": approved[j]}
+        for j in range(3)
+    ]
+    st, rep = call("POST", f"/sessions/{sidr}/ceding-report",
+                   {"policy_id": 5, "parties": parties})
+    check(st == 200 and rep["claim_count"] == 40,
+          f"报送清单返回 40 笔，HTTP {st}")
+    check([c["claim_id"] for c in rep["claims"]]
+          == sorted(c["claim_id"] for c in rep["claims"]),
+          "清单按理赔 ID 升序")
+    row_ok = all(
+        sum(sh["amount"] for sh in c["shares"]) == c["amount"]
+        for c in rep["claims"]
+    )
+    check(row_ok, "每笔各方份额合计恰好等于该笔理赔金额")
+    round_ok = True
+    for c in rep["claims"]:
+        for sh in c["shares"]:
+            f = c["amount"] * sh["ratio_bps"] // 10000
+            ce = f + (0 if c["amount"] * sh["ratio_bps"] % 10000 == 0 else 1)
+            if not (f <= sh["amount"] <= ce):
+                round_ok = False
+            if sh["rounded"] not in ("up", "down", "exact"):
+                round_ok = False
+    check(round_ok, "每个份额都是约定比例的向上/向下整分取值（含整除 exact）")
+    col = [0, 0, 0]
+    for c in rep["claims"]:
+        for j, sh in enumerate(c["shares"]):
+            col[j] += sh["amount"]
+    check(col == approved, f"各方跨笔合计等于核定总额：{col}")
+    _, rep_b = call("POST", f"/sessions/{sidr}/ceding-report",
+                    {"policy_id": 5, "parties": parties})
+    check(rep == rep_b, "同一快照与同一输入重取结果完全一致")
+
+    # 已入账明细原样保留：挑一笔 33.33% 非整除的理赔，锁定其 ceil 给 P1
+    # （种子金额均为 100 的倍数，100*3333/10000=33.33 非整除）
+    target = next(
+        r for r in rrows if r["amount"] * 3333 % 10000 != 0
+    )
+    locked_ceil = (target["amount"] * 3333 + 9999) // 10000
+    ratios2 = [6667, 3333]
+    floors2 = [sum(r["amount"] * w // 10000 for r in rrows) for w in ratios2]
+    approved2 = floors2.copy()
+    approved2[1] += 1  # P1 因入账 ceil 多 1 分
+    approved2[0] = rtotal - approved2[1]
+    parties2 = [
+        {"party": "P0", "ratio_bps": 6667, "approved_total": approved2[0]},
+        {"party": "P1", "ratio_bps": 3333, "approved_total": approved2[1]},
+    ]
+    booked = [{"claim_id": target["claim_id"], "party": "P1",
+               "amount": locked_ceil}]
+    st, rep2 = call("POST", f"/sessions/{sidr}/ceding-report",
+                    {"policy_id": 5, "parties": parties2, "booked": booked})
+    check(st == 200, f"带已入账明细的清单生成成功，HTTP {st}")
+    locked_share = next(
+        sh for c in rep2["claims"] if c["claim_id"] == target["claim_id"]
+        for sh in c["shares"] if sh["party"] == "P1"
+    )
+    check(locked_share["amount"] == locked_ceil and locked_share["booked"] is True,
+          f"已入账金额 {locked_ceil} 原样保留且标记 booked=true")
+    check(
+        all(p["allocated_total"] == p["approved_total"] for p in rep2["parties"]),
+        "入账锁定后各方合计仍精确等于核定总额",
+    )
+
+    # 无法同时满足：核定总额之和 != 理赔总额 -> 422 且无部分清单
+    bad_parties = [
+        {"party": "P0", "ratio_bps": 7000, "approved_total": approved2[0] + 1},
+        {"party": "P1", "ratio_bps": 3000, "approved_total": approved2[1]},
+    ]
+    st, err = call("POST", f"/sessions/{sidr}/ceding-report",
+                   {"policy_id": 5, "parties": bad_parties})
+    check(st == 422 and err["code"] == "totals_mismatch" and "claims" not in err,
+          f"总额对不上时 HTTP 422（{err['code']}），不返回部分清单")
+    # 比例合计不是 10000 -> 422
+    st, err = call("POST", f"/sessions/{sidr}/ceding-report", {
+        "policy_id": 5,
+        "parties": [
+            {"party": "A", "ratio_bps": 4000, "approved_total": 1},
+            {"party": "B", "ratio_bps": 5000, "approved_total": 1},
+        ],
+    })
+    check(st == 422, "比例基点合计不等于 10000 时请求被拒绝（422）")
+    # 保单不属于会话地区 -> 404
+    st, err = call("POST", f"/sessions/{sidr}/ceding-report", {
+        "policy_id": 1, "parties": parties2,
+    })
+    check(st == 404 and err["code"] == "policy_not_found",
+          "保单不在会话地区快照中 -> 404 policy_not_found")
+    call("POST", f"/sessions/{sidr}/close")
+    st, err = call("POST", f"/sessions/{sidr}/ceding-report",
+                   {"policy_id": 5, "parties": parties2})
+    check(st == 409 and "claims" not in err,
+          "会话关闭后报送清单被拒绝（409），不返回明细")
+
+    # ------------------------------------------------------------------
     if TTL_WAIT:
-        title(5, "到期失效：60 秒后会话自动到期，取页 410 且无明细")
+        title(6, "到期失效：60 秒后会话自动到期，取页 410 且无明细")
         _, s6 = call("POST", "/sessions", {"region": "华南"})
         sid6 = s6["session_id"]
         print("    等待 62 秒让会话到期 …")

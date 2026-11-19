@@ -5,6 +5,11 @@
 互不影响；会话有数量上限与 TTL，可主动关闭，关闭/到期后未开始响应的取页
 一律失败且不返回明细。
 
+在此基础上提供**再保报送清单**：从指定地区快照会话读取指定保单的全部理赔
+（至多 100 笔），把每笔金额按 2~5 家分保方的约定比例（整数基点）取到整分，
+使每笔各方合计等于理赔金额、各方跨笔合计等于已核定总额，并可原样保留
+已入账明细。
+
 ## 一、快速启动（Docker Compose）
 
 ```bash
@@ -57,6 +62,7 @@ open ──主动关闭──▶ closing ──回滚事务/还连接/释放名�
 | GET | `/sessions/{id}` | 查询会话状态 |
 | POST | `/sessions/{id}/close` | 主动关闭 |
 | GET | `/sessions/{id}/claims?page=1&page_size=100` | 快照内分页取理赔明细 |
+| POST | `/sessions/{id}/ceding-report` | 再保报送清单：快照内取指定保单全部理赔并按约定比例取整整分 |
 | POST | `/admin/policies` | 源端补录保单 |
 | POST | `/admin/claims` | 源端补录理赔 |
 | PATCH | `/admin/claims/{id}?amount=999` | 源端改金额 |
@@ -71,7 +77,83 @@ HTTP 409
  "code": "session_not_open"}
 ```
 
-## 四、慢取页演示
+## 四、再保报送清单（份额取整到整分）
+
+`POST /sessions/{session_id}/ceding-report` 在**会话快照内**读取指定保单的
+全部理赔（claim_id 升序，至多 100 笔），按分保方约定比例把每笔份额取到整分，
+对齐已核定的分保方总额。该接口与取页共用同一套开放/到期/关闭闸门：
+会话关闭已受理、到期或失效时一律失败且不返回清单。
+
+### 请求体
+
+```json
+{
+  "policy_id": 5,
+  "parties": [
+    {"party": "P0", "ratio_bps": 5000, "approved_total": 953000},
+    {"party": "P1", "ratio_bps": 3000, "approved_total": 571800},
+    {"party": "P2", "ratio_bps": 2000, "approved_total": 381200}
+  ],
+  "booked": [
+    {"claim_id": 221, "party": "P1", "amount": 840}
+  ]
+}
+```
+
+- `parties`：2~5 家分保方；`ratio_bps` 为整数基点（1bp=0.01%），合计必须
+  恰为 `10000`；`approved_total` 为该分保方已核定的跨笔合计总额（分）。
+- `booked`：可为空的已入账明细（理赔 ID、分保方、整分金额）。入账金额必须
+  本身就是该笔按约定比例的 floor/ceil 取值，服务端**原样保留**且标记
+  `"booked": true`；其余格点在剩余可行空间内取整。
+
+### 取整与约束语义
+
+| 规则 | 实现 |
+| --- | --- |
+| 每格只能向上或向下取到整分 | 全程整数运算，格点取值域为 `[floor(amount·ratio/10000), ceil(...)]`，整除时二者相等（标记 `exact`） |
+| 每笔各方合计 = 理赔金额 | 归约为每行固定向上取总格点数 `r_i = amount - Σfloor` 的 0/1 矩阵 |
+| 各方跨笔合计 = 核定总额 | 归约为每列固定向上取总格点数 `c_j = approved_j - Σfloor`（含入账预占） |
+| 已入账原样保留 | 入账 ceil/floor 直接锁定对应 0/1，不参与自由分配；非法入账值拒绝 |
+| 无法同时满足 | 返回 422 并说明原因，**不返回部分清单** |
+| 同快照同输入重取一致 | 最小费用最大流 + 全局唯一费用序（余数降序，平局按理赔 id、分保方次序），规范解唯一确定 |
+
+算法本质是二部图 b-匹配（理赔→分保方），用最小费用最大流求可行流，费用序
+对应"最大余数法"：余数 `amount·ratio - floor·10000` 越大的格点越优先向上
+取整。纯函数实现位于 `app/apportionment.py`，不依赖数据库，可独立单测。
+
+### 响应（节选）
+
+```json
+{
+  "session_id": "...", "region": "华南", "policy_id": 5,
+  "claim_count": 40, "snapshot_time": "2026-...",
+  "parties": [
+    {"party": "P0", "ratio_bps": 5000, "approved_total": 953000, "allocated_total": 953000}
+  ],
+  "claims": [
+    {"claim_id": 221, "amount": 2800, "shares": [
+      {"party": "P0", "ratio_bps": 5000, "amount": 1400, "rounded": "exact", "booked": false},
+      {"party": "P1", "ratio_bps": 3000, "amount": 840,  "rounded": "exact", "booked": true}
+    ]}
+  ]
+}
+```
+
+### 失败码（响应体只含 `detail`/`code`，无 `claims` 字段）
+
+| HTTP | code | 触发条件 |
+| --- | --- | --- |
+| 404 | `session_not_found` / `policy_not_found` | 会话不存在/失效，或保单不在会话地区快照中 |
+| 409 | `session_not_open` | 关闭已受理/会话不可用 |
+| 410 | `session_expired` | 会话已到期 |
+| 422 | `invalid_ratios` / `invalid_parties` / `invalid_approved_total` | 分保方数量、基点合计、重名、负核定总额等输入不合法 |
+| 422 | `totals_mismatch` | 各方核定总额之和 ≠ 保单理赔总额，行和与列和不可能同时成立 |
+| 422 | `booked_not_roundable` / `booked_claim_unknown` / `booked_party_unknown` / `duplicate_booked` | 已入账明细不合法 |
+| 422 | `allocation_infeasible` | 输入合法但不存在满足全部约束的取整方案（含入账锁定导致无解） |
+| 422 | `too_many_claims` | 保单在该快照下理赔超过 100 笔 |
+| 503 | `session_broken` | 快照连接失效，会话作废 |
+
+## 五、慢取页演示
 
 镜像默认 `ENABLE_DEBUG_HOOKS=true`，带 `X-Debug-Sleep-Seconds` 请求头
 可让本次取页在执行 SQL 前先睡眠，用于演示"关闭及时受理"：
@@ -83,9 +165,10 @@ DEMO_TTL_WAIT=1 python3 demo/demo.py # 追加等待到期场景（约多花 1 �
 ```
 
 演示覆盖：分页与重复取页一致性、源端写入的快照隔离、名额满 429、
-慢取页期间关闭（在途请求结束后失败、无明细）、到期失效。
+慢取页期间关闭（在途请求结束后失败、无明细）、到期失效，以及再保报送清单
+（取整整分、行和/列和精确对齐、入账原样保留、无解 422 不返回部分清单）。
 
-## 五、本地自测（无 Docker 时）
+## 六、本地自测（无 Docker 时）
 
 仓库测试以真实 uvicorn + PostgreSQL 运行：
 
@@ -94,14 +177,19 @@ pip install -r requirements.txt
 # 准备一个 PostgreSQL 15，并执行 db/init/01_schema.sql、02_seed.sql
 DATABASE_URL=postgresql://actuary:actuary@127.0.0.1:5432/claims \
 SESSION_TTL_SECONDS=2 ENABLE_DEBUG_HOOKS=true \
-python -m unittest tests.test_api -v
+python -m unittest tests.test_apportionment tests.test_api -v
 ```
 
-15 个用例覆盖：分页/上限/参数校验、重复取页同快照、两表 JOIN 快照、
-源端增改删不可见、名额与释放、关闭幂等、慢取页+关闭竞争、
-到期清理、连接丢失作废不续取、服务重启旧会话 404。
+- `tests.test_apportionment`（28 个，纯算法、无需数据库）：floor/ceil、
+  行和/列和、入账锁定与各类非法输入、确定性重取，并对小实例**穷举全部可行
+  0/1 矩阵**验证全局成本最优；对 100 笔 × 5 家做压力与不变量核对。
+- `tests.test_api`（28 个端到端）：分页/上限/参数校验、重复取页同快照、
+  两表 JOIN 快照、源端增改删不可见、名额与释放、关闭幂等、慢取页+关闭竞争、
+  到期清理、连接丢失作废不续取、服务重启旧会话 404；以及报送清单的
+  happy path、确定性、入账保留、无解 422、保单跨地区 404、关闭/到期拒绝、
+  快照隔离、空保单与 100 笔上限。
 
-## 六、配置项（环境变量）
+## 七、配置项（环境变量）
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |

@@ -9,7 +9,21 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 
 from .config import settings
+from .apportionment import (
+    AllocationError,
+    BookedItem,
+    MAX_CLAIMS,
+    Party,
+    build_allocation,
+)
 from .schemas import (
+    CedingBookedItemIn,
+    CedingClaimOut,
+    CedingPartyIn,
+    CedingPartyTotalOut,
+    CedingReport,
+    CedingReportRequest,
+    CedingShareOut,
     ClaimIn,
     ClaimOut,
     ClaimPage,
@@ -54,6 +68,15 @@ app = FastAPI(
 async def session_error_handler(request: Request, exc: SessionError):
     return JSONResponse(
         status_code=exc.http_status,
+        content={"detail": exc.message, "code": exc.code},
+    )
+
+
+@app.exception_handler(AllocationError)
+async def allocation_error_handler(request: Request, exc: AllocationError):
+    # 取整约束无法同时满足：说明原因，绝不返回部分清单。
+    return JSONResponse(
+        status_code=422,
         content={"detail": exc.message, "code": exc.code},
     )
 
@@ -190,6 +213,108 @@ async def fetch_claims(
         snapshot_time=session.snapshot_time,
         rows=[ClaimRow(**row) for row in rows],
     )
+
+
+# ----------------------------------------------------------------------
+# 再保报送清单：快照内读指定保单全部理赔，并按约定比例把份额取到整分
+# ----------------------------------------------------------------------
+@app.post(
+    "/sessions/{session_id}/ceding-report",
+    response_model=CedingReport,
+    tags=["ceding-report"],
+    summary="生成再保报送清单（份额按约定比例取整到整分，对齐核定总额）",
+    responses={
+        404: {"model": Message, "description": "会话不存在/失效，或保单不在会话地区"},
+        409: {"model": Message, "description": "关闭已受理/会话不可用"},
+        410: {"model": Message, "description": "会话已到期"},
+        422: {"model": Message, "description": "输入校验失败或取整约束无法同时满足"},
+        503: {"model": Message, "description": "快照连接失效，会话作废"},
+    },
+)
+async def build_ceding_report(session_id: str, body: CedingReportRequest):
+    def _serve():
+        # 多取 1 行判断是否超过 100 笔上限；闸门语义与取页完全一致：
+        # 关闭已受理/到期/失效时这里直接抛 SessionError，不返回任何明细。
+        policy_found, rows = manager.fetch_policy_claims(
+            session_id, body.policy_id, MAX_CLAIMS + 1
+        )
+        if not policy_found:
+            raise SessionError(
+                "policy_not_found",
+                f"保单 {body.policy_id} 在会话 {session_id} 的地区快照中不存在",
+                http_status=404,
+            )
+        if len(rows) > MAX_CLAIMS:
+            raise AllocationError(
+                "too_many_claims",
+                f"保单 {body.policy_id} 在该快照下有超过 {MAX_CLAIMS} 笔理赔，"
+                "单次报送清单至多包含 100 笔",
+            )
+
+        parties = [
+            Party(
+                party=p.party,
+                ratio_bps=p.ratio_bps,
+                approved_total=p.approved_total,
+            )
+            for p in body.parties
+        ]
+        booked = [
+            BookedItem(
+                claim_id=item.claim_id, party=item.party, amount=item.amount
+            )
+            for item in (body.booked or [])
+        ]
+        allocations = build_allocation(
+            claims=[(row["claim_id"], row["amount"]) for row in rows],
+            parties=parties,
+            booked=booked,
+        )
+
+        # 以分保方在请求中的次序输出合计，便于精算逐方核对
+        totals = {p.party: 0 for p in parties}
+        claim_out: list[CedingClaimOut] = []
+        for alloc in allocations:
+            shares = [
+                CedingShareOut(
+                    party=s.party,
+                    ratio_bps=s.ratio_bps,
+                    amount=s.amount,
+                    rounded=s.rounded,
+                    booked=s.booked,
+                )
+                for s in alloc.shares
+            ]
+            for s in alloc.shares:
+                totals[s.party] += s.amount
+            claim_out.append(
+                CedingClaimOut(
+                    claim_id=alloc.claim_id, amount=alloc.amount, shares=shares
+                )
+            )
+
+        party_totals = [
+            CedingPartyTotalOut(
+                party=p.party,
+                ratio_bps=p.ratio_bps,
+                approved_total=p.approved_total,
+                allocated_total=totals[p.party],
+            )
+            for p in parties
+        ]
+        session = manager.get_status(session_id)
+        return CedingReport(
+            session_id=session_id,
+            region=session.region,
+            policy_id=body.policy_id,
+            claim_count=len(claim_out),
+            snapshot_time=session.snapshot_time,
+            parties=party_totals,
+            claims=claim_out,
+        )
+
+    # AllocationError 由全局异常处理器映射为 422（含原因，无部分清单）
+    return await asyncio.to_thread(_serve)
 
 
 # ----------------------------------------------------------------------

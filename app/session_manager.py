@@ -257,6 +257,78 @@ class SessionManager:
             with session.state_lock:
                 session.in_flight -= 1
 
+    def fetch_policy_claims(self, session_id: str, policy_id: int, limit: int):
+        """在会话快照内读取指定保单的全部理赔（claim_id 升序）。
+
+        与取页走完全相同的开放/到期/关闭闸门与 io_lock 串行化：
+        会话关闭已受理、到期或失效时抛出 SessionError，不返回任何明细。
+
+        :return: ``(policy_found, rows)``；``policy_found`` 表示该保单在
+            快照中存在且属于会话地区，``rows`` 至多 ``limit`` 行，
+            多取 1 行由调用方判断是否超限。
+        """
+        session = self._get(session_id)
+
+        with session.state_lock:
+            if session.status != "open":
+                raise SessionUnavailable(
+                    "session_not_open",
+                    f"会话 {session_id} 状态为 {session.status}，"
+                    "关闭已受理或会话已结束，报送清单失败且不返回明细",
+                    http_status=409,
+                )
+            if _utcnow() >= session.expires_at:
+                raise SessionUnavailable(
+                    "session_expired",
+                    f"会话 {session_id} 已到期，报送清单失败且不返回明细",
+                    http_status=410,
+                )
+            session.in_flight += 1
+
+        try:
+            with session.io_lock:
+                with session.state_lock:
+                    if session.status != "open":
+                        raise SessionUnavailable(
+                            "session_not_open",
+                            f"会话 {session_id} 关闭已受理，"
+                            "该报送清单请求尚未开始响应，已失败且不返回明细",
+                            http_status=409,
+                        )
+                policy_row = session.conn.execute(
+                    "SELECT id, region FROM policies "
+                    "WHERE id = %s AND region = %s",
+                    (policy_id, session.region),
+                ).fetchone()
+                policy_found = policy_row is not None
+                rows: list[dict] = []
+                if policy_found:
+                    rows = session.conn.execute(
+                        "SELECT c.id AS claim_id, c.policy_id AS policy_id, "
+                        "p.region AS region, c.amount AS amount "
+                        "FROM claims c JOIN policies p ON p.id = c.policy_id "
+                        "WHERE c.policy_id = %s AND p.region = %s "
+                        "ORDER BY c.id ASC LIMIT %s",
+                        (policy_id, session.region, limit),
+                    ).fetchall()
+                with session.state_lock:
+                    session.pages_served += 1
+                    session.last_page_at = _utcnow()
+                return policy_found, rows
+        except SessionUnavailable:
+            raise
+        except psycopg.Error as exc:
+            self._teardown(session, reason="connection_lost")
+            raise SessionError(
+                "session_broken",
+                f"数据库连接或快照失效，会话 {session_id} 已作废，"
+                f"不会换快照续取：{exc.sqlstate_name if hasattr(exc, 'sqlstate_name') else exc}",
+                http_status=503,
+            )
+        finally:
+            with session.state_lock:
+                session.in_flight -= 1
+
     def _query_page(self, session: Session, page: int, page_size: int):
         # 多取一行判断 has_more；OFFSET 分页基于快照内固定结果集，
         # 重复取同一页得到完全相同的数据。
